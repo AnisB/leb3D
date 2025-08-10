@@ -1,0 +1,21 @@
+#define WORKGROUP_RES 8
+
+// CBVs
+#define GLOBAL_CB_BINDING_SLOT b0
+
+// Includes
+#include "shader_lib/common.hlsl"
+#include "shader_lib/constant_buffers.hlsl"
+
+// UAVs
+RWTexture2D<float4> _ColorTexture: register(u0);
+
+[numthreads(WORKGROUP_RES, WORKGROUP_RES, 1)]
+void TonemapFrame(uint2 threadID : SV_DispatchThreadID)
+{   
+    // Accumulate the new sample with the previous history
+    float3 finalColor = _ColorTexture[threadID].xyz;
+
+    // Tonemap and export
+    _ColorTexture[threadID] = float4(1.0 - tonemap(finalColor), 1.0);
+}

@@ -1,0 +1,184 @@
+#define WORKGROUP_RES 8
+#define WORKGROUP_SIZE WORKGROUP_RES * WORKGROUP_RES
+
+// CBVs
+#define GLOBAL_CB_BINDING_SLOT b0
+#define SKY_ATMOSPHERE_BUFFER_SLOT b1
+#define GRID_CB_BINDING_SLOT b2
+
+// SRVs
+#define DENSITY_BUFFER_0_BINDING_SLOT t0
+#define DENSITY_BUFFER_1_BINDING_SLOT t1
+#define TRANSMITTANCE_LUT_TEXTURE_SLOT t2
+#define MULTI_SCATTERING_LUT_TEXTURE_SLOT t3
+
+// Samplers
+SamplerState _sampler_linear_clamp : register(s0);
+
+// Includes
+#include "shader_lib/common.hlsl"
+#include "shader_lib/constant_buffers.hlsl"
+#include "shader_lib/grid_utilities.hlsl"
+#include "shader_lib/intersection.hlsl"
+#include "shader_lib/sky.hlsl"
+
+// UAVs
+RWTexture2D<float4> _ColorTexture: register(u0);
+
+float4 forward_pt(float3 rayOrigin, inout float3 rayDir, float3 sunDir, int3 currentCellCoords, uint32_t seed)
+{
+    // Initialize our loop
+    float4 inScatAtt = float4(0.0, 0.0, 0.0, 1.0);
+    uint32_t sampleIdx = 0;
+
+    // While we are looping
+    uint32_t segementIdx = 0;
+    while (segementIdx < NUM_MAX_SEGMENTS && valid_cell_coord(currentCellCoords))
+    {
+        // Generate the mean ray distance undivided
+        float maxRayDistanceUD = -log(1.0f - URng(seed));
+
+        // Generate the direction we will be exploring
+        if (segementIdx != 0)
+            rayDir = sample_sphere(float2(URng(seed), URng(seed)));
+        
+        int3 moveIdx = sign(rayDir);
+        while (maxRayDistanceUD > 0.0 && valid_cell_coord(currentCellCoords))
+        {
+            // Evaluate the density of the current cell
+            float density = grid_density(currentCellCoords);
+
+            // Compute the normalized grid positon
+            float3 positionGS = (rayOrigin - _GridMinPosition) / (_GridMaxPosition - _GridMinPosition) * _GridResolution;
+
+            // Compute the position in the cell
+            float3 positionInCell = positionGS - currentCellCoords;
+
+            if (moveIdx.x >= 0)
+                positionInCell.x = 1.0 - positionInCell.x;
+
+            if (moveIdx.y >= 0)
+                positionInCell.y = 1.0 - positionInCell.y;
+
+            if (moveIdx.z >= 0)
+                positionInCell.z = 1.0 - positionInCell.z;
+
+            // Project this position along each ray axis
+            float3 projected = positionInCell / abs(rayDir) / _GridResolution;
+
+            // Take the minimal dimension of the 3
+            float t = 0.0;
+            uint3 candidateCell = currentCellCoords;
+            if (projected.x <= projected.y && projected.x <= projected.z)
+            {
+                t = projected.x;
+                candidateCell.x += moveIdx.x;
+            }
+            else if (projected.y <= projected.x && projected.y <= projected.z)
+            {
+                t = projected.y;
+                candidateCell.y += moveIdx.y;
+            }
+            else
+            {
+                t = projected.z;
+                candidateCell.z += moveIdx.z;
+            }
+
+            // Two options here, either we've reached the end of the segment, or we continue to the next primitive
+            float normalizedDistance = t * density;
+            if (normalizedDistance < maxRayDistanceUD)
+            {
+                maxRayDistanceUD -= normalizedDistance;
+                currentCellCoords = candidateCell;
+            }
+            else
+            {
+                t = maxRayDistanceUD / density;
+                maxRayDistanceUD = 0.0;
+            }
+
+            // Move along the ray
+            rayOrigin += t * rayDir;
+        }
+
+        // Post scattering event
+        if (valid_cell_coord(currentCellCoords))
+        {
+            // Alebdo of the particle
+            inScatAtt.w *= _VolumeAlbedo;
+
+            // Russian roulette
+            float rr = URng(seed);
+            if (rr > inScatAtt.w && valid_cell_coord(currentCellCoords))
+            {
+                inScatAtt.w = 0.0;
+                break;
+            }
+
+            // Next event estimation, add light contribution
+            float density = integrate_density(rayOrigin, sunDir, currentCellCoords);
+            inScatAtt.xyz += inScatAtt.w * exp(-density) * sun_color();
+        }
+
+        segementIdx++;
+    }
+
+    // Done
+    return inScatAtt;
+}
+
+[numthreads(WORKGROUP_RES, WORKGROUP_RES, 1)]
+void InsideVolumeIntegrator(uint2 threadID : SV_DispatchThreadID)
+{
+    // Evaluate the cell index
+    float3 rayOriginLS = _CameraPosition * _GridScale;
+    float3 rayDirLS = transform_dir(evaluate_ray_direction(threadID.xy), _GridScale);
+    float3 sunDirLS = _SunDirection * _GridScale;
+
+    // Evaluate the density
+    int3 cellCoords = evaluate_cell_coords(rayOriginLS);
+    uint32_t seed = pixel_seed(threadID, _ScreenSize.xy, _FrameIndex);
+    float4 inScatAtt = forward_pt(rayOriginLS, rayDirLS, sunDirLS, cellCoords, seed);
+
+    // Combine and return the result
+    float3 skyColor = sky_color(transform_dir_inv(rayDirLS, _GridScale));
+    float3 finalColor = inScatAtt.xyz + inScatAtt.w * skyColor;
+    _ColorTexture[threadID] = float4(finalColor, 1.0);
+}
+
+[numthreads(WORKGROUP_RES, WORKGROUP_RES, 1)]
+void OutsideVolumeIntegrator(uint2 threadID : SV_DispatchThreadID)
+{
+    // Evaluate the ray direction
+    float3 rayOriginLS = _CameraPosition * _GridScale;
+    float3 rayDirLS = transform_dir(evaluate_ray_direction(threadID.xy), _GridScale);
+    float3 sunDirLS = _SunDirection * _GridScale;
+
+    // First we intersect with the box
+    float2 inters = intersect_ray_aabb(rayOriginLS, rayDirLS, _GridMinPosition, _GridMaxPosition);
+
+    // Do we intersect the volume in front of us?
+    if (inters.x > 0.0 && inters.x < inters.y)
+    {   
+        // Compute the entry point intersection
+        float3 initialPosition = clamp(rayOriginLS + rayDirLS * inters.x, _GridMinPosition, _GridMaxPosition);
+
+        // Evaluate the cell index
+        int3 cellCoords = evaluate_cell_coords(initialPosition);
+
+        // Inscattering
+        uint32_t seed = pixel_seed(threadID, _ScreenSize.xy, _FrameIndex);
+
+        // Combine and return the result
+        float4 inScatAtt = forward_pt(rayOriginLS + rayDirLS * inters.x, rayDirLS, sunDirLS, cellCoords, seed);
+        float3 skyColor = sky_color(transform_dir_inv(rayDirLS, _GridScale));
+        _ColorTexture[threadID] = float4(inScatAtt.xyz + inScatAtt.w * skyColor, 1.0);
+    }
+    else
+    {   
+        // Evaluate the sky color and return
+        float3 skyColor = sky_color(transform_dir_inv(rayDirLS, _GridScale));
+        _ColorTexture[threadID] = float4(skyColor, 1.0);
+    }
+}

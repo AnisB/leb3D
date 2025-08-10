@@ -1,0 +1,73 @@
+#define WORKGROUP_RES 8
+#define WORKGROUP_SIZE WORKGROUP_RES * WORKGROUP_RES
+
+// CBVs
+#define GLOBAL_CB_BINDING_SLOT b0
+#define LEB_CB_BINDING_SLOT b1
+
+// SRVs
+#define TETRA_BUFFER_0_BINDING_SLOT t0
+#define TETRA_BUFFER_1_BINDING_SLOT t1
+#define PRIMITIVE_BUFFER_BINDING_SLOT t2
+#define DISTANCE_BUFFER_BINDING_SLOT t3
+#define DIRECTION_BUFFER_BINDING_SLOT t4
+
+// Includes
+#include "shader_lib/common.hlsl"
+#include "shader_lib/constant_buffers.hlsl"
+#include "shader_lib/leb_utilities.hlsl"
+
+// SRVs
+StructuredBuffer<uint32_t> _PrimitiveBuffer: register(PRIMITIVE_BUFFER_BINDING_SLOT);
+StructuredBuffer<float> _DistanceBuffer: register(DISTANCE_BUFFER_BINDING_SLOT);
+
+// UAVs
+RWTexture2D<float4> _ColorTexture: register(u0);
+
+[numthreads(WORKGROUP_RES, WORKGROUP_RES, 1)]
+void InsideVolumeIntegrator(uint2 threadID : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
+{
+    // Load the directions to shared memory
+    load_direction_to_sm(groupIndex);
+
+    if (_InitialPrimitive == UINT32_MAX)
+    {
+        _ColorTexture[threadID] = float4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+
+    // Evaluate the density
+    float3 rayOriginLS = _CameraPosition * _LEBScale;
+    float3 rayDirLS = transform_dir(evaluate_ray_direction(threadID.xy), _LEBScale);
+
+    // Evaluate the density
+    float totalDensity = integrate_density(rayOriginLS, rayDirLS, _InitialPrimitive);
+    totalDensity = fast_tonemap(totalDensity);
+    _ColorTexture[threadID] = float4(totalDensity, totalDensity, totalDensity, 1.0);
+}
+
+[numthreads(WORKGROUP_RES, WORKGROUP_RES, 1)]
+void OutsideVolumeIntegrator(uint2 threadID : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
+{
+    // Load the directions to shared memory
+    load_direction_to_sm(groupIndex);
+
+    // Ray direction
+    float3 rayOriginLS = _CameraPosition * _LEBScale;
+    float3 rayDirLS = transform_dir(evaluate_ray_direction(threadID.xy), _LEBScale);
+
+    // Any primitive to intersect?
+    uint32_t primitiveIdx = threadID.x + _ScreenSize.x * threadID.y;
+    if (_PrimitiveBuffer[primitiveIdx] == UINT32_MAX)
+    {
+        _ColorTexture[threadID] = float4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+
+    // Evalute the inscattering
+    float totalDensity = integrate_density(rayOriginLS + rayDirLS * _DistanceBuffer[primitiveIdx], rayDirLS, _PrimitiveBuffer[primitiveIdx]);
+    totalDensity = fast_tonemap(totalDensity);
+
+    // Return the result
+    _ColorTexture[threadID] = float4(totalDensity, totalDensity, totalDensity, 1.0);
+}

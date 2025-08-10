@@ -1,0 +1,53 @@
+#define WORKGROUP_RES 8
+#define WORKGROUP_SIZE WORKGROUP_RES * WORKGROUP_RES
+
+// CBVs
+#define GLOBAL_CB_BINDING_SLOT b0
+#define LEB_CB_BINDING_SLOT b1
+
+// Includes
+#include "shader_lib/common.hlsl"
+#include "shader_lib/constant_buffers.hlsl"
+#include "shader_lib/intersection.hlsl"
+
+// SRVs
+StructuredBuffer<uint32_t> _ElementIndexBuffer : register(t0);
+RaytracingAccelerationStructure _InterfaceRTAS : register(t1);
+
+// UAVs
+RWStructuredBuffer<uint32_t> _PrimitiveBufferRW: register(u0);
+RWStructuredBuffer<float> _DistanceBufferRW: register(u1);
+
+[numthreads(8, 8, 1)]
+void IntersectBVH(uint2 threadID : SV_DispatchThreadID)
+{
+    // Ray description
+    RayDesc ray;
+    ray.Origin = _CameraPosition * _LEBScale;
+    ray.Direction = normalize(evaluate_ray_direction(threadID.xy) * _LEBScale);
+    ray.TMin = 0.000;
+    ray.TMax = 100.0f;
+
+    // Initialize the query
+    RayQuery<RAY_FLAG_CULL_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_CULL_BACK_FACING_TRIANGLES> query;
+
+    // Set up a trace.  No work is done yet.
+    query.TraceRayInline(_InterfaceRTAS, RAY_FLAG_FORCE_OPAQUE, 0xff, ray);
+
+    // Run the traversal
+    query.Proceed();
+
+    // Did we hit something?
+    uint32_t primitiveIdx = threadID.x + _ScreenSize.x * threadID.y;
+    if (query.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+    {
+        // Output to the visibility buffer
+        uint32_t triangleID = query.CommittedPrimitiveIndex();
+        _PrimitiveBufferRW[primitiveIdx] = _ElementIndexBuffer[triangleID];
+        _DistanceBufferRW[primitiveIdx] = query.CommittedRayT();
+    }
+    else
+    {
+        _PrimitiveBufferRW[primitiveIdx] = UINT32_MAX;
+    }
+}

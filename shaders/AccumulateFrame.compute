@@ -1,0 +1,29 @@
+#define WORKGROUP_RES 8
+
+// CBVs
+#define GLOBAL_CB_BINDING_SLOT b0
+
+// UAVs
+#define SAMPLE_TEXTURE_RW_BINDING_SLOT u0
+#define HISTORY_TEXTURE_RW_BINDING_SLOT u1
+
+// Includes
+#include "shader_lib/common.hlsl"
+#include "shader_lib/constant_buffers.hlsl"
+
+// UAVs
+RWTexture2D<float4> _SampleTexture: register(SAMPLE_TEXTURE_RW_BINDING_SLOT);
+RWTexture2D<float4> _HistoryTexture: register(HISTORY_TEXTURE_RW_BINDING_SLOT);
+
+[numthreads(WORKGROUP_RES, WORKGROUP_RES, 1)]
+void AccumulateFrame(uint2 threadID : SV_DispatchThreadID)
+{   
+    // Accumulate the new sample with the previous history
+    float3 finalColor = _SampleTexture[threadID].xyz * _FrameAccumulationFactors.x + _HistoryTexture[threadID].xyz * _FrameAccumulationFactors.y;
+
+    // Export raw for next frame
+    _HistoryTexture[threadID] = float4(finalColor, 1.0);
+
+    // Tonemap and export
+    _SampleTexture[threadID] = float4(tonemap(finalColor), 1.0);
+}

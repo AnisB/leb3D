@@ -1,0 +1,147 @@
+// CBVs
+#define GLOBAL_CB_BINDING_SLOT b0
+#define LEB_CB_BINDING_SLOT b1
+
+// SRVs
+#define POSITION_BUFFER_BINDING_SLOT t0
+#define TETRA_BUFFER_0_BINDING_SLOT t1
+#define TETRA_BUFFER_1_BINDING_SLOT t2
+
+// Includes
+#include "shader_lib/common.hlsl"
+#include "shader_lib/constant_buffers.hlsl"
+#include "shader_lib/leb_utilities.hlsl"
+
+// SRVs
+StructuredBuffer<float3> _PositionBuffer : register(POSITION_BUFFER_BINDING_SLOT);
+
+static const uint g_indices[12] = {0, 2, 1, 0, 1, 3, 1, 2, 3, 2, 0, 3};
+
+struct VertexInput
+{
+    uint instanceID : SV_InstanceID;
+    uint vertexID : SV_VertexID;
+};
+
+struct VertexOutput
+{
+    float4 position : SV_POSITION;
+    float3 positionRWS : POSITION_RWS;
+    float3 color : COLOR;
+    float density : DENSITY;
+};
+
+VertexOutput vert(VertexInput input)
+{
+    // Initialize the output structure
+    VertexOutput output;
+    output = (VertexOutput)0;
+
+    // Get the vertex position
+    uint instanceOffset = input.instanceID * 4;
+    float3 instanceCenter = (_PositionBuffer[instanceOffset] + _PositionBuffer[instanceOffset + 1] + _PositionBuffer[instanceOffset + 2] + _PositionBuffer[instanceOffset + 3]) / 4.0f;
+    float3 vertexPos = _PositionBuffer[instanceOffset + g_indices[input.vertexID]];
+    float3 rescaledPos = (vertexPos - instanceCenter) + instanceCenter;
+
+    // Output for the next stage
+    output.positionRWS = rescaledPos / _LEBScale - _CameraPosition;
+    output.position = mul(_ViewProjectionMatrix, float4(output.positionRWS, 1.0));
+
+    // Read the tetra data
+    float density = leb_density(get_tetra_data(input.instanceID));
+    output.color = density > 0.0 ? float3(1.0, 0.0, 0.0) : float3(0.5, 1.0, 0.5);
+    output.density = density;
+    return output;
+}
+
+struct GeometryInput
+{
+    float4 positionCS : SV_POSITION;
+    float3 positionRWS : POSITION_RWS;
+    float3 color : COLOR;
+    float density : DENSITY;
+};
+
+struct GeometryOutput
+{
+    float4 positionCS : SV_POSITION;
+    float3 positionRWS : POSITION_RWS;
+    float3 color : COLOR;
+    float3 dist : DISTANCE;
+    float density : DENSITY;
+};
+
+[maxvertexcount(3)]
+void geom(triangle GeometryInput input[3], inout TriangleStream<GeometryOutput> outStream)
+{   
+    // Compute the vectors and the area
+    float2 p0 = clip_space_to_pixel(input[0].positionCS, _ScreenSize.xy);
+    float2 p1 = clip_space_to_pixel(input[1].positionCS, _ScreenSize.xy);
+    float2 p2 = clip_space_to_pixel(input[2].positionCS, _ScreenSize.xy);
+    float2 v[3] = {p2 - p1, p2 - p0, p1 - p0};
+    float area = abs(v[1].x * v[2].y - v[1].y * v[2].x);
+
+    // Emit the vertices
+    GeometryOutput output = (GeometryOutput)0;
+    for (uint vertID = 0; vertID < 3; ++vertID)
+    {
+        output.positionCS = input[vertID].positionCS;
+        output.color = input[vertID].color;
+        output.positionRWS = input[vertID].positionRWS;
+        output.dist = 0.0;
+        output.density = input[vertID].density;
+        output.dist[vertID] = area * rsqrt(dot(v[vertID],v[vertID]));
+        outStream.Append(output);
+    }
+    outStream.RestartStrip();
+}
+
+struct PixelInput
+{
+    float4 positionCS : SV_POSITION;
+    float3 positionRWS : POSITION_RWS;
+    float3 color : COLOR;
+    float3 dist : DISTANCE;
+    float density : DENSITY;
+};
+
+struct PixelOutput
+{
+    float4 attachment0 : SV_Target0;
+};
+
+float3 apply_wireframe(float3 color, float3 wireFrameColor, float wireframeSize, float3 dist)
+{
+    if (wireframeSize > 0.0)
+    {
+        float3 d2 = dist * dist;
+        float nearest = min(min(d2.x, d2.y), d2.z);
+        float f = exp2(-nearest / wireframeSize);
+        color = lerp(color, wireFrameColor, f);
+    }
+    return color;
+}
+
+PixelOutput frag(PixelInput input)
+{
+    // Evaluate the distance to camera
+    float distanceToCamera = length(input.positionRWS);
+
+     // View vector
+    float3 viewWS = -input.positionRWS / max(distanceToCamera, 0.00001);
+
+    // Normal vector
+    float3 normalWS = normalize(cross(ddx(input.positionRWS), ddy(input.positionRWS)));
+    float3 roughness = 0.8;
+    float3 diffuseColor = float3(1.0, 1.0, 1.0);
+
+    // NdotV
+    float NdotV = dot(viewWS, normalWS);
+
+    // Evaluate the wireframe
+    input.color = apply_wireframe(input.color * 0.0, 0.1, 0.4, input.dist);
+
+    PixelOutput output;
+    output.attachment0 = float4(input.color, 1.0);
+    return output;
+}

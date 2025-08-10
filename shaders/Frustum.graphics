@@ -1,0 +1,181 @@
+// Includes
+#include "shader_lib/common.hlsl"
+#define GLOBAL_CB_BINDING_SLOT b0
+#include "shader_lib/constant_buffers.hlsl"
+#include "shader_lib/intersection.hlsl"
+
+struct VertexInput
+{
+    uint instanceID : SV_InstanceID;
+    uint vertexID : SV_VertexID;
+};
+
+struct VertexOutput
+{
+    float4 positionCS : SV_POSITION;
+    float3 positionWS : POSITION_WS;
+};
+
+// Points of the frustum
+static const float3 pointsCS[] = {  float3(1, 0.0, 1.0), float3(1, 1, 1.0), float3(0, 0, 0.0),
+                                    float3(0.0, 0.0, 1.0), float3(0.0, 1, 1.0), float3(0.0, 1, 0.0),
+                                    float3(1.0, 1.0, 1.0), float3(0.0, 1, 1.0), float3(0.0, 1, 0.0),
+                                    float3(1.0, 0.0, 1.0), float3(0.0, 0, 1.0), float3(0.0, 1, 0.0),
+                                };
+
+cbuffer _UpdateCB : register(b1)
+{
+    // View projection matrix used for the update
+    float4x4 _UpdateViewProjectionMatrix;
+
+    // Inverse View projection matrix used for the update
+    float4x4 _UpdateInvViewProjectionMatrix;
+
+    // Camera position used for the update
+    float3 _UpdateCameraPosition;
+    // FOV
+    float _UpdateFOV;
+
+    // Volume min
+    float3 _VolumeMinPosition;
+    // Far plane
+    float _UpdateFarPlaneDistance;
+
+    // Volume max
+    float3 _VolumeMaxPosition;
+    // Padding
+    float _PaddingUB0;
+};
+
+VertexOutput vert(VertexInput input)
+{
+    VertexOutput output;
+    float3 pt = pointsCS[input.vertexID];
+    float3 positionRWS = float3(0.0, 0.0, 0.0);
+    if (pt.z != 0.0)
+    {
+        // Evaluate the position
+        positionRWS = evaluate_world_space_position(pt.xy, 1.0, _UpdateInvViewProjectionMatrix);
+
+        // Normalize
+        float distToCamera = length(positionRWS);
+        positionRWS /= distToCamera;
+
+        // Corner distance
+        float aspectRatio = _ScreenSize.x / _ScreenSize.y;
+        positionRWS *= (_UpdateFarPlaneDistance / cos(_UpdateFOV) / cos(_UpdateFOV * aspectRatio));
+
+        // Camera relative
+        positionRWS += float3(_UpdateCameraPosition - _CameraPosition);
+    }
+    else
+    {
+        positionRWS = evaluate_world_space_position(float2(0.5, 0.5), 0.1, _UpdateInvViewProjectionMatrix);
+        positionRWS += float3(_UpdateCameraPosition - _CameraPosition);
+    }
+
+    // Make it render camera relative
+    output.positionCS = mul(_ViewProjectionMatrix, float4(positionRWS, 1.0));
+    output.positionWS = positionRWS + _CameraPosition;
+    return output;
+}
+
+struct GeometryInput
+{
+    float4 positionCS : SV_POSITION;
+    float3 positionWS : POSITION_WS;
+};
+
+struct GeometryOutput
+{
+    float4 positionCS : SV_POSITION;
+    float3 positionWS : POSITION_WS;
+    nointerpolation float2 p0 : POSITION0;
+    nointerpolation float2 p1 : POSITION1;
+    nointerpolation float2 p2 : POSITION2;
+};
+
+[maxvertexcount(3)]
+void geom(triangle GeometryInput input[3], inout TriangleStream<GeometryOutput> outStream)
+{   
+    GeometryOutput output = (GeometryOutput)0;
+    output.p0 = clip_space_to_pixel(input[0].positionCS, _ScreenSize.xy);
+    output.p1 = clip_space_to_pixel(input[1].positionCS, _ScreenSize.xy);
+    output.p2 = clip_space_to_pixel(input[2].positionCS, _ScreenSize.xy);
+    // Emit the vertices
+    for (uint vertID = 0; vertID < 3; ++vertID)
+    {
+        output.positionCS = input[vertID].positionCS;
+        output.positionWS = input[vertID].positionWS;
+        outStream.Append(output);
+    }
+    outStream.RestartStrip();
+}
+
+struct PixelInput
+{
+    float4 positionCS : SV_POSITION;
+    float3 positionWS : POSITION_WS;
+    nointerpolation float2 p0 : POSITION0;
+    nointerpolation float2 p1 : POSITION1;
+    nointerpolation float2 p2 : POSITION2;
+};
+
+struct PixelOutput
+{
+    float4 attachment0 : SV_Target0;
+};
+
+void getLine(float2 B1, float2 B2, out float a, out float b, out float c)
+{
+   a = B1.y - B2.y;
+   b = B2.x - B1.x;
+   c = B1.x * B2.y - B2.x * B1.y;
+}
+
+float dist(float2 p0, float2 p1, float2 p)
+{
+    float a, b, c;
+    getLine(p0, p1, a, b, c);
+    return abs(a * p.x + b * p.y + c) / sqrt(a * a + b * b);
+}
+
+PixelOutput frag_above(PixelInput it)
+{
+    // compute the wireframe
+    PixelOutput output;
+    float d0 = dist(it.p0, it.p1, it.positionCS.xy);
+    float d1 = dist(it.p1, it.p2, it.positionCS.xy);
+    float d2 = dist(it.p2, it.p0, it.positionCS.xy);
+    float minD = min(min(d0, d1), d2);
+    float f = (saturate(minD / 3.0));
+
+    // Intersect the ray leaving from the pixel and heading to the current camera position, if it intersects the volume, adjust
+    float3 rayOrigin = it.positionWS;
+    float3 rayDir = normalize(_CameraPosition - it.positionWS);
+    float t = ray_box_intersection(rayOrigin, rayDir, _VolumeMinPosition, _VolumeMaxPosition);
+    if (t > 0.0)
+        discard;
+    output.attachment0 = float4(float3(0.8, 0.2, 0.0), 1.0 - f * f);
+    return output;
+}
+
+PixelOutput frag_under(PixelInput it)
+{
+    // compute the wireframe
+    PixelOutput output;
+    float d0 = dist(it.p0, it.p1, it.positionCS.xy);
+    float d1 = dist(it.p1, it.p2, it.positionCS.xy);
+    float d2 = dist(it.p2, it.p0, it.positionCS.xy);
+    float minD = min(min(d0, d1), d2);
+    float f = (saturate(minD / 3.0));
+
+    // Intersect the ray leaving from the pixel and heading to the current camera position, if it intersects the volume, adjust
+    float3 rayOrigin = it.positionWS;
+    float3 rayDir = normalize(_CameraPosition - it.positionWS);
+    float t = ray_box_intersection(rayOrigin, rayDir, _VolumeMinPosition, _VolumeMaxPosition);
+    if (t <= 0.0)
+        discard;
+    output.attachment0 = float4(1.0 - float3(0.8, 0.2, 0.0), 1.0 - f * f);
+    return output;
+}

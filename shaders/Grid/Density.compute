@@ -1,0 +1,65 @@
+#define WORKGROUP_RES 8
+#define WORKGROUP_SIZE WORKGROUP_RES * WORKGROUP_RES
+
+// CBVs
+#define GLOBAL_CB_BINDING_SLOT b0
+#define GRID_CB_BINDING_SLOT b1
+
+// SRVs
+#define DENSITY_BUFFER_0_BINDING_SLOT t0
+#define DENSITY_BUFFER_1_BINDING_SLOT t1
+
+// Includes
+#include "shader_lib/common.hlsl"
+#include "shader_lib/constant_buffers.hlsl"
+#include "shader_lib/grid_utilities.hlsl"
+#include "shader_lib/intersection.hlsl"
+
+// UAVs
+RWTexture2D<float4> _ColorTexture: register(u0);
+
+[numthreads(WORKGROUP_RES, WORKGROUP_RES, 1)]
+void InsideVolumeIntegrator(uint2 threadID : SV_DispatchThreadID)
+{
+    // Evaluate the ray direction
+    float3 rayOrigin = _CameraPosition * _GridScale;
+    float3 rayDir = evaluate_ray_direction(threadID.xy) * _GridScale;
+    
+    // Evaluate the cell index
+    int3 cellCoords = evaluate_cell_coords(rayOrigin);
+
+    // Evaluate the density
+    float totalDensity = integrate_density(rayOrigin, rayDir, cellCoords);
+    totalDensity = fast_tonemap(totalDensity);
+    _ColorTexture[threadID] = float4(totalDensity, totalDensity, totalDensity, 1.0);
+}
+
+[numthreads(WORKGROUP_RES, WORKGROUP_RES, 1)]
+void OutsideVolumeIntegrator(uint2 threadID : SV_DispatchThreadID)
+{
+    // Evaluate the ray direction
+    float3 rayOrigin = _CameraPosition * _GridScale;
+    float3 rayDir = evaluate_ray_direction(threadID.xy) * _GridScale;
+
+    // First we intersect with the box
+    float2 inters = intersect_ray_aabb(rayOrigin, rayDir, _GridMinPosition, _GridMaxPosition);
+
+    // Do we intersect the volume in front of us?
+    if (inters.x > 0.0 && inters.x < inters.y)
+    {   
+        // Compute the entry point intersection
+        float3 initialPosition = clamp(rayOrigin + rayDir * inters.x, _GridMinPosition, _GridMaxPosition);
+
+        // Evaluate the cell index
+        int3 cellCoords = evaluate_cell_coords(initialPosition);
+
+        // Evaluate the density
+        float totalDensity = integrate_density(initialPosition, rayDir, cellCoords);
+        totalDensity = fast_tonemap(totalDensity);
+        _ColorTexture[threadID] = float4(totalDensity, totalDensity, totalDensity, 1.0);
+    }
+    else
+    {
+        _ColorTexture[threadID] = float4(0.0, 0.0, 0.0, 1.0);
+    }
+}

@@ -1,0 +1,202 @@
+#define WORKGROUP_RES 8
+#define WORKGROUP_SIZE WORKGROUP_RES * WORKGROUP_RES
+
+// CBVs
+#define GLOBAL_CB_BINDING_SLOT b0
+#define SKY_ATMOSPHERE_BUFFER_SLOT b1
+#define LEB_CB_BINDING_SLOT b2
+#define GRID_CB_BINDING_SLOT b3
+
+// SRVs
+#define TETRA_BUFFER_0_BINDING_SLOT t0
+#define TETRA_BUFFER_1_BINDING_SLOT t1
+#define DIRECTION_BUFFER_BINDING_SLOT t2
+#define TRANSMITTANCE_LUT_TEXTURE_SLOT t3
+#define MULTI_SCATTERING_LUT_TEXTURE_SLOT t4
+
+// Samplers
+SamplerState _sampler_linear_clamp : register(s0);
+
+// Includes
+#include "shader_lib/common.hlsl"
+#include "shader_lib/constant_buffers.hlsl"
+#include "shader_lib/intersection.hlsl"
+#include "shader_lib/leb_utilities.hlsl"
+#include "shader_lib/grid_utilities.hlsl"
+#include "shader_lib/sky.hlsl"
+
+// SRVs
+StructuredBuffer<uint32_t> _PrimitiveBuffer: register(t5);
+StructuredBuffer<float> _DistanceBuffer: register(t6);
+
+// UAVs
+RWTexture2D<float4> _ColorTexture: register(u0);
+
+
+// Integration function
+float4 forward_pt(float3 rayOrigin, inout float3 rayDir, float3 sunDir, uint32_t currentPrimitive, uint32_t seed)
+{
+    // Initialize our loop
+    float4 inScatAtt = float4(0.0f, 0.0, 0.0, 1.0f);
+    uint32_t sampleIdx = 0;
+
+    // While we are looping
+    uint32_t segementIdx = 0;
+    while (segementIdx < NUM_MAX_SEGMENTS && currentPrimitive != INVALID_NEIGHBOR)
+    {
+        // Generate the mean ray distance undivided
+        float maxRayDistanceUD = -log(1.0f - URng(seed));
+
+        // Generate the direction we will be exploring
+        if (segementIdx != 0)
+            rayDir = sample_sphere(float2(URng(seed), URng(seed)));
+
+        // Initialize our loop
+        uint32_t prevPrimitive = INVALID_NEIGHBOR;
+
+        // March our structure
+        float prevL = 0.0;
+        while (maxRayDistanceUD > 0.0 && currentPrimitive != INVALID_NEIGHBOR)
+        {
+            // Read the tetra data
+            TetraData data = get_tetra_data(currentPrimitive);
+            uint4 neighbors = decompress_neighbors(data.cmpNeighbors);
+
+            // Max intersection
+            float l = FLT_MAX;
+
+            // Process the faces
+            uint32_t candidate = INVALID_NEIGHBOR;
+
+            // Define our exit interface
+            [unroll]
+            for (uint32_t faceIdx = 0; faceIdx < 4; ++faceIdx)
+            {
+                if ((neighbors[faceIdx] == INVALID_NEIGHBOR || neighbors[faceIdx] != prevPrimitive))
+                {
+                    // Get the plane equation
+                    float3 planeDir;
+                    float offset;
+                    decompress_plane_equation(data.equations[faceIdx], planeDir, offset);
+
+                    // Intersect
+                    float t = ray_plane_intersection(rayOrigin, rayDir, planeDir, offset);
+                    if (t < l)
+                    {
+                        l = t;
+                        candidate = neighbors[faceIdx];
+                    }
+                }
+            }
+
+            // Current step
+            float cl = l - prevL;
+
+            // Two options here, either we've reached the end of the segment, or we continue to the next primitive
+            float density = leb_density(data);
+            float normalizedDistance = cl * density;
+            if (normalizedDistance < maxRayDistanceUD)
+            {
+                maxRayDistanceUD -= normalizedDistance;
+                prevPrimitive = currentPrimitive;
+                currentPrimitive = candidate;
+            }
+            else
+            {
+                // Adjust the step
+                cl = maxRayDistanceUD / density;
+                maxRayDistanceUD = 0.0;
+            }
+
+            // Move along the ray
+            prevL += cl;
+        }
+
+        // Move the origin
+        rayOrigin += prevL * rayDir;
+
+        // Post scattering event
+        if (currentPrimitive != INVALID_NEIGHBOR)
+        {
+            // Attenuation
+            inScatAtt.w *= _VolumeAlbedo;
+            
+            // Russian roulette
+            float rr = URng(seed);
+            if (rr > inScatAtt.w && currentPrimitive != INVALID_NEIGHBOR)
+            {
+                inScatAtt.w = 0.0;
+                break;
+            }
+
+            // Next event estimation
+            float density = integrate_density(rayOrigin, sunDir, currentPrimitive);
+            inScatAtt.xyz += inScatAtt.w * exp(-density) * sun_color();
+        }
+
+        // New segment
+        segementIdx++;
+    }
+
+    // Done
+    return inScatAtt;
+}
+
+[numthreads(WORKGROUP_RES, WORKGROUP_RES, 1)]
+void InsideVolumeIntegrator(uint2 threadID : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
+{
+    // Load the directions to shared memory
+    load_direction_to_sm(groupIndex);
+
+    if (_InitialPrimitive == UINT32_MAX)
+    {
+        _ColorTexture[threadID] = float4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+
+    // Evaluate the density
+    float3 rayOriginLS = _CameraPosition * _LEBScale;
+    float3 rayDirLS = transform_dir(evaluate_ray_direction(threadID.xy), _LEBScale);
+    float3 sunDirLS = _SunDirection * _LEBScale;
+
+    // Integration
+    uint32_t seed = pixel_seed(threadID, _ScreenSize.xy, _FrameIndex);
+    float4 inScatAtt = forward_pt(rayOriginLS, rayDirLS, sunDirLS, _InitialPrimitive, seed);
+
+    // Combine and return the result
+    float3 skyColor = sky_color(transform_dir_inv(rayDirLS, _LEBScale));
+    float3 finalColor = inScatAtt.xyz + inScatAtt.w * skyColor;
+    _ColorTexture[threadID] = float4(finalColor, 1.0);
+}
+
+[numthreads(WORKGROUP_RES, WORKGROUP_RES, 1)]
+void OutsideVolumeIntegrator(uint2 threadID : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
+{
+    // Load the directions to shared memory
+    load_direction_to_sm(groupIndex);
+
+    // Ray direction
+    float3 rayOriginLS = _CameraPosition * _LEBScale;
+    float3 rayDirLS = transform_dir(evaluate_ray_direction(threadID.xy), _LEBScale);
+    float3 sunDirLS = _SunDirection * _LEBScale;
+
+    // Any primitive to intersect?
+    uint32_t primitiveIdx = threadID.x + _ScreenSize.x * threadID.y;
+    if (_PrimitiveBuffer[primitiveIdx] == UINT32_MAX)
+    {
+        float3 skyColor = sky_color(transform_dir_inv(rayDirLS, _LEBScale));
+        _ColorTexture[threadID] = float4(skyColor, 1.0);
+        return;
+    }
+
+    // Evaluate the seed of this pixel
+    uint32_t seed = pixel_seed(threadID, _ScreenSize.xy, _FrameIndex);
+
+    // Evalute the inscattering
+    float4 inScatAtt = forward_pt(rayOriginLS + rayDirLS * _DistanceBuffer[primitiveIdx], rayDirLS, sunDirLS, _PrimitiveBuffer[primitiveIdx], seed);
+
+    // Combine and return the result
+    float3 skyColor = sky_color(transform_dir_inv(rayDirLS, _LEBScale));
+    float3 finalColor = inScatAtt.xyz + inScatAtt.w * skyColor;
+    _ColorTexture[threadID] = float4(finalColor, 1.0);
+}
