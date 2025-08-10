@@ -1,5 +1,7 @@
 This repository contains a project that implements the technique described in the paper [**Adaptive Tetrahedral Grids for Volumetric Path-Tracing**](https://arxiv.org/abs/2506.11510) published at the conference *Siggraph 2025*.
 
+![gensub_273s2-file2](https://github.com/user-attachments/assets/99a0f720-08b5-4355-952a-cdcd5fc91b91)
+
 This demo relies on **DX12** and some **Shader model 6.6** features. Here are the steps to get it running:
 
 - Clone the repo and open a terminal in the root folder of the repo
